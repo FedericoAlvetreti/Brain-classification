@@ -1,0 +1,357 @@
+---
+title: "Statistical Learning - HW2 Report"
+author: "Alvetreti - Corrias - Dicunta - Di Nino"
+date: "2023-06-10"
+output: 
+  rmdformats::readthedown:
+    theme: cerulean
+    highlight: espresso
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+source('library_HW2.R')
+
+library(igraph)
+library(readr)
+library(foreach)
+library(iterators)
+library(doParallel)
+library(ggplot2)
+library(e1071)
+library(tidyverse)
+library(MNITemplate)
+library(rgl)
+library(vars)
+library(caret)
+library(graphkernels)
+library(Hmisc)
+library(sgof)
+library(fclust)
+library(cluster)
+library(stepPlr)
+library(tseries)
+library(stats)
+library(glmnet)
+
+train <- read_csv('stuff/train_prepro.csv')
+test <- read_csv('stuff/test_prepro.csv')
+
+train$...1 <- NULL
+test$...1 <- NULL
+
+
+train <- train %>% drop_na()
+```
+
+## Introduction
+
+This is the report for Homework 2 in Statistical Learning course made by G22. The task was a binary classification over a multivariate time series dataset retrieved from the ABIDE project.\
+The data preparation was basically a signal processing over time, in order to gather data satisfying some requirements: in particular we wanted the signals to be first-order stationary, denoised and scaled to a common range. \
+We defined a pipeline strongly related to a specific feature engineering based on the phenomenon of interest from a neuroscientific perspective, involving functional connectome of the ROI in the brain: this was made through a topological approach, following the survey *Identification of segregated regions in the functional brain connectome of autistic patients by a combination of fuzzy spectral clustering and entropy analysis* from Journal of Psychiatry and Neuroscience, 2016, March.\
+Then we opted for a penalized logistic regression: LASSO penalization somehow can track an assessment of the features, and this is useful as a benchmark for the leave one covariate out (LOCO) implementation we did as a last step of our analysis.\
+All the methods we call within this report are in a R file called ```library_HW2.R``` that is made available fully commented and explained.
+
+## Preprocessing
+
+Our trainset is made many observations of 600 patients. In particular, we have their ```sex``` and ```age``` and 116 time series of 115 measurements corresponding to as many ROIs. 
+
+Our basic preprocessing consisted of the following steps:
+
++ We minMax scaled the age through all the dataset;
+
++ We splitted the categorical variable ```sex``` into two dummy variables to one-hot encode this feature;
+
++ We encoded the response variable into a 0-1 variable;
+
++ We dropped the rows that presented homogenous null signals in the train set.
+
+```{r firstPipeline, eval=FALSE, echo=TRUE}
+train$age <- min_max_rescaling(train$age)
+train$sex <- as.numeric(train$sex=="male")
+train$y <- as.numeric(train$y == "autism")
+train$male <- train$sex
+train$female <- 1-train$sex 
+train$sex <- NULL
+
+test$age <- min_max_rescaling(test$age)
+test$sex <- as.numeric(test$sex=="male")
+test$male <- test$sex
+test$female <- 1-test$sex 
+test$sex <- NULL
+
+train <- find_null_series(train)
+test <- correct_null_series(test)
+```
+
+
+Than we move to some preprocessing steps specifically meant for time series.
+
+1) We defined a routine called ```make_stationary()``` based on the ```diff()``` operator with ```lag=1``` to ensure that the time series were first order stationary. This is a recursive function that keep on differencing the series since the augmented Dickey-Fuller test ```adf.test()``` doesn't reject the null hypotesis. We decided to do this step in preprocessing because we tried many models involving vectorial auto regressive and similar which have stationarity as an assumption: we know that this is crucial for forecasting rather than classification, but we did it to achieve more robustness in the pipeline. 
+
+2) We then implemented a routine ```fft_denoiser()``` based on fast Fourier transform to filter the high frequencies and then rebuilding the signal through an inverse FFT;
+
+```{r denoising, eval=T, echo=F,fig.cap="\\label{fig:figs}Example of denoising over a Wiener process"}
+series <- cumsum(rnorm(10000))/10000
+plot.ts(min_max_rescaling(series), ylab='', xlab='')
+lines(min_max_rescaling(fft_denoiser(series, 0.0005)), col='red',lwd=2)
+```
+
+3) In the end we leveraged the Hampel filter in the ```pracma``` package to detect and filter the outliers;
+
+4) Finally we scaled series-wise to have all the features on the same range.
+
+In the test dataset we applied the same procedure, but we could not drop the rows with silent signals, so we substituted with column-wise means. 
+
+We made maybe an overkilling preprocessing for our purposes but we considered this whole part as an exercise ahead of the final project, which is based on scalar-on-signal regression. 
+
+
+## Feature engineering
+
+We decided to try to reproduce the results of the following [article](https://www.ncbi.nlm.nih.gov/pmc/articles/PMC4764481/#b3-jpn-41-124) in order to have an interpretable model: the survey is about a relevant result on intrinsic functional network segregation. The ability for specialized processes to occur within densely interconnected groups of brain regions is reduced in autistic patients. This justifies the choice of using graph theory and methods such as fuzzy spectral clustering and modularity analysis to model the phenomenon highlighting the differencies within the two groups.
+
+In order to build the graph we followed the steps highlighted in the paper:
+
++ first we computed the matrix $W$ based on the Spearman correlation. We take for each element the p-value of the correlation test as a dissimilarity measure for each pair of ROIs;
+
++ from that we evaluated the adjacency matrix $A$ where each element is the complement of $W$ which represent the “strength” of the connectivity between ROIs;
+
++ given $D$ as the diagonal degree matrix of $A$ we then compute the laplacian $L = D - W$;
+
++ then we build the matrix $U$ as the concatenation of the $u_1, ..., u_k$ vectors where each vector $u_i$ is the eigenvector corresponding to the smallest eigenvalue $k_i$;
+
++ we proceeded with the clustering in two steps: first with k-means to get the initials centroids, then with the fuzzy version we computed the matrix $C$ which represents the membership of each ROI with respect to each cluster.
+
+The value of $k$ which is the key of the process described above was calculated using the slope method which is based on the silhouette statistic: $\hat{k} = \underset{k \in \{2,...,n-1\}}{\mathrm{argmax}} \{ -[s(k+1) - s(k)]s(k)^p\}$
+
+We finally used $C$ to build the graph setting a threshold in order to get the most relevant edges. From the graph we evaluated the following features:
+
++ modularity;
++ assortativity coefficient;
++ mean distance;
++ graphlet;
++ strengths;
++ transitivity coefficients;
++ degree coefficients;
++ Shannon entropy;
++ eigenvector centrality;
++ autocorrelation;
+
+This features are a binding between the ones we read about in the previous survey and the ones we read about in this other [paper](https://www.sciencedirect.com/science/article/pii/S105381190901074X?casa_token=nNzl7Xr9AMMAAAAA:ttGCVXnl4WrLySCusmwe9thTNaFWzFKiOEf0xk3opUBi1lkkUmy2YlYswsJEAB1C2W48HiJ8).
+
+
+## A first features assessment
+
+Before going forward with model design and tuning we decided to have a look to the statistical significance of our features. In order to do this we did the following: 
+
++ Segregate the features table between ASD patients and control ones;
+
++ Perform for each of the features a Mann-Whitney test between the ASD group and the control one to assess any difference on the empirical distribution of that specific covariate in the two groups, retrieving the p-values;
+
++ Filtering the p-values with a Bonferroni correction, such that we define a rejection on the null hypotesis $H_0: F_{X_i} = G_{Y_i}$ to be significant if $p \leq \frac{\alpha}{M}$. 
+
+Unfortunately what we came up with is that none of the features we gathered had any statistical significance. That perhaps is cause by some imprecision in the feature extraction pipeline, or by some of the limits of the model or within the dataset. Infact our range of action is restricted to only 116 ROIs while the survey worked on 316 ROIs and a larger sample of patients. So since we couldn't express any statistical significance through the feature extraction, at least we can assess the importance of these covariates from a model perspective, having a look at the performance of a LASSO logistic regression and comparing it with the LOCO framework. 
+
+By the way we can consider Bonferroni correction to be too conservative for our purposes since we are just considering hypotesis without any strong assumption behind them, so just to restrict our feature space we decided to drop the Bonferroni correction assuming that in our procedure we are not retrieving any conclusion about the significance from this operation, but we just want to select some feature to lighten our pipeline. If we just consider significance of feature if p-value from Mann-Whitney is lower than the level of significance $\alpha = 0.05$, we retrieve a feature set of 68 features, whose index is stored in the array ```relevant```. 
+
+```{r loading, include=F}
+train <- read_csv('stuff/final_train_features.csv')
+test <- read_csv('stuff/final_test_features.csv')
+train <- data.frame(train)
+test <- data.frame(test)
+```
+
+```{r OurFailure, echo=F, eval=T,fig.cap="\\label{fig:figs}Feature selection looking at p-values without corrections"}
+pvalues <- c()
+
+aut <- which(train[,362] == 1)
+contr <- which(train[,362] == 0)
+
+for (i in 1:360) {
+  aut_ <- train[aut,i]
+  contr_ <- train[contr,i]
+  test <- wilcox.test(as.numeric(aut_),as.numeric(contr_))
+  pvalues <- append(pvalues,test$p.value)
+}
+
+
+relevant <- which(pvalues <=0.05)
+
+plot.ts(pvalues, xlab='Features')
+abline(h=0.05, lty=2, col='red')
+points(relevant,pvalues[relevant], cex=.5, pch=19)
+```
+
+## Model design
+
+We implemented a penalized logistic regression using the ```glmnet``` package to perform both the validation and the training of the model. This is the code we used to do so:
+
+```{r ourModel, eval=T, echo=T}
+
+# Two level factor on the response 
+train[,362] <- as.factor(train[,362])
+
+cvfit <-  cv.glmnet(x=data.matrix(train[,relevant]),
+                    y=data.matrix(train[,362]), 
+                    family = "binomial", 
+                    type.measure = "class", 
+                    alpha = 1,
+                    nfolds = 10)
+
+log <- glmnet(x=data.matrix(train[,relevant]),
+              y=data.matrix(train[,362]), 
+              family = "binomial",
+              alpha = 1,
+              lambda=cvfit$lambda.min)
+```
+
+From the cross validation of this model we gathered a measure of about 60% of accuracy in validation phase. 
+Somehow LASSO regression has an inner mechanism of feature selection, since the ones that got killed are the redundant features: the interesting thing is now to compare what LASSO does with our feature space and see what LOCO has to say about the same features. The regularization path is the following one: as we can say almost every feature has been shrinked near zero and likely there are some that have been killed. 
+
+```{r ourModel2, eval=T, echo=F}
+log <- glmnet(x=data.matrix(train[,relevant]),
+              y=data.matrix(train[,362]), 
+              family = "binomial",
+              alpha = 1)
+
+plot(log,xvar='lambda')
+
+abline(v=log(cvfit$lambda.min), lty=2, col='red')
+```
+
+
+## LOCO implementation
+
+Our implementation of the *leave one covariate out* framework, namely LOCO, followed these steps:
+
++ We splitted the trainset in $D_1$ and $D_2$;
+
++ We trained a *SANEmodel* over the $D_1$;
+
++ Then all the covariates we looped the following procedure: 
+
+  + We trained a *LOCOmodel* $f^{-i}$ over $D_1^{-i}$, i.e. $D_1$ without the i-th covariate;
+  
+  + Then we bootstrapped the following statistical functional $\theta = \mathrm{median} \{L(Y,f^{-i}(X))-L(Y,f(X))|D_1\}$ from the "validation" set $D_2$ where the loss measure is derived from cross-entropy loss within each data point;
+  
+  + We used the bootstrapped information to make set inference, building percentile confidence intervals, but we also stored the bootstrapped point estimate for $\theta$.\
+  
+This is the code for the function ```LOCO()```:
+
+``` {r LOCO}
+LOCO <- function(df, split_ratio = 0.8, B = 1000, alpha = 0.05){
+  
+  LOCO_iteration <- function(D_1, D_2, feature_index, B, alpha){
+    library(caret)
+    accuracy <- function(model, df) {
+      preds <- as.numeric(unlist(predict(model, df)))
+      y <- as.numeric(unlist(df["y"]))
+      return(c(abs(preds - y)))
+    }
+    
+    sane_model <- glm(y~., data = D_1, family = "binomial")
+    
+    loco_model <- glm(y~., data = D_1[-feature_index], family = "binomial")
+    
+    bootstrap_values <- rep(NA,B)
+    
+    for (b in c(1:B)) {
+      boots_idxs <- sample(1:dim(D_2)[1], replace=TRUE)
+      D_boots <- D_2[boots_idxs,]
+      bootstrap_values[b] <- median(accuracy(loco_model, D_boots) - accuracy(sane_model, D_boots))
+    }
+    
+    bootstrap_values <- sort(bootstrap_values)
+    alpha <- alpha / (dim(D_1)[2] - 1)
+    
+    point_estimate <- mean(bootstrap_values)
+    q_1 <- bootstrap_values[ceiling(B*alpha/2)]
+    q_2 <- bootstrap_values[ceiling(B*(1-(alpha/2)))]
+    
+    return(c("feature" = feature_index, "lower" = q_1, "feature_importance" = point_estimate, "upper" = q_2))
+    
+  }
+  split_data <- function(df, split_ratio){
+    
+    N <- dim(df)[1]
+    sample <- sample(1:N, round(split_ratio * dim(df)[1]))
+    D_1  <- df[sample,]
+    D_2  <- df[-sample,]
+    return(list("D_1"=D_1, "D_2"=D_2))
+  }
+  
+  c(D_1,D_2) := split_data(df, split_ratio)
+  
+  number_of_features <- dim(df)[2]-1
+  
+  result <- foreach(feature = c(1:number_of_features), .combine = rbind) %dopar% 
+    LOCO_iteration(D_1, D_2, feature, B, alpha )
+  
+  
+  return(data.frame(result))
+}
+```
+  
+  
+
+## Analysis and diagnostic
+```{r trick, include=F}
+train_relevant <- train[,c(relevant,362)]
+cvfit <-  cv.glmnet(x=data.matrix(train[,relevant]),
+                    y=data.matrix(train[,362]), 
+                    family = "binomial", 
+                    type.measure = "class", 
+                    alpha = 1,
+                    nfolds = 10)
+
+log <- glmnet(x=data.matrix(train[,relevant]),
+              y=data.matrix(train[,362]), 
+              family = "binomial",
+              alpha = 1,
+              lambda=cvfit$lambda.min)
+loco_train <- read_csv('stuff/loco_train.csv')
+```
+
+```{r LASTPLOT, echo=F}
+killed <- which(log$beta==0)
+
+h_0 <- intersect(which(loco_train$upper > 0),which(loco_train$lower < 0))
+
+
+plot(loco_train$feature_importance, ylim=c(min(loco_train$lower)-0.02,max(loco_train$upper)+0.02),
+     xlab='Feature index',ylab='LOCO inference')
+
+segments(x0 = loco_train$feature, y0 = loco_train$lower, y1=loco_train$upper)
+segments(x0 = h_0, y0 = loco_train$lower[h_0], y1 = loco_train$upper[h_0], col='pink', lwd=2)
+points(killed, loco_train$feature_importance[killed], col='purple',cex=1.2, pch=16)
+abline(h=0)
+legend(x=c(10,60),
+       y=c(min(loco_train$lower)-0.01,min(loco_train$lower)+0.04),
+       legend=c('LOCO-wise indifferent','Killed by LASSO'), 
+       col=c('pink','purple'),
+       y.intersp = 0.1,
+       horiz=T,
+       text.font=3,
+       lty=c(1,NA),
+       pch=c(NA,16),
+       bty = "n",
+       lwd=2)
+```
+
+As we assessed before, our features are likely to have none statistical significance. This is coherent with what we retrieved through the LOCO framework, since for all the 68 features we selected we have very low score in absolute value, meaning that not only the features are not significant to classify between autistic and control patients but also that some of them worsen the performance of the classification task: the ones that are likely to bring improvement, bring very small improvement.
+
+Trying to be more formal particular we can consider the following hypotesis scenario: 
+
+$$ 
+\begin{cases}
+H_0: \theta = 0 \\
+H_1: \theta \neq 0
+\end{cases}
+$$
+
+where $\theta$ is the statistical functional of interest as we have defined it before. Through the set inference we can say that we cannot reject the null hypotesis for all the features whose confidence interval for $\theta$ includes zero at the Bonferroni-adjusted level of confidence. 
+
+LASSO logistic regression doesn't really provide a hierarchical point of view over the features, but we can suppose that in a more robust statistical setting the features for which we can't reject $H_0$ or that have high evidency for $\theta > 0$ should be the ones that in a LASSO path suffer the most the effect of penalization: infact $\theta > 0$ means that the model works worst without that covariate.
+
+In our case this is only partial true, as the LASSO killed also features for which we can reject $H_0$ and for which $\theta < 0$, meaning that the model $f^{-i}$ works better, but still maybe this partial correctness is just an evidence for the weaknesses of our pipeline.
+
